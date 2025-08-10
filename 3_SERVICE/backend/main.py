@@ -13,18 +13,20 @@ from repository import ModelsRepository, BgTasksRepository
 from services import TrainerService, BGTasksService
 from settings import logger, app_config, LOG_FILE_PATH
 from store import loaded_models
-
-
+  
+# Этот менеджер контекста управляет жизненным циклом приложения:
 @asynccontextmanager
 async def lifespan(application: FastAPI):
     """Context manager for the lifespan of the FastAPI application."""
     os.makedirs(LOG_FILE_PATH.parent, exist_ok=True)
-
+	# вот тут в свойстве process_executor инициализуирем пулл реквестов - кол-во ядер - 1
+	# Инициализация пула процессов
     application.state.process_executor = ProcessPoolExecutor(
         max_workers=app_config.cores_cnt - 1
     )
     logger.info("Пул процессов запущен")
 
+	# агрузка предобученных моделей
     async with AsyncSessionFactory() as session:
         await TrainerService(
             models_repo=ModelsRepository(session),
@@ -51,13 +53,20 @@ app = FastAPI(
 )
 
 
-@app.middleware("http")
+@app.middleware("http") # # Декоратор регистрирует функцию как HTTP middleware
 async def log_requests(request: Request, call_next):
     """Middleware function to log HTTP requests."""
-    method = request.method
+    method = request.method # HTTP метод:
     url = str(request.url)
-    http_version = request.scope.get("http_version", "1.1")
+    http_version = request.scope.get("http_version", "1.1") # Версия HTTP протокола
     response = await call_next(request)
+      # call_next() - ключевая функция middleware!
+    # Она передает запрос дальше по цепочке обработки:
+    # 1. К следующему middleware (если есть)
+    # 2. К роутеру FastAPI  
+    # 3. К конечному обработчику (endpoint)
+    # 4. Ждет response и возвращает его обратно
+    # await - ждем выполнения, так как обработка может быть долгой
     logger.info(
         '%s:%d - "%s %s HTTP/%s" %d',
         request.client.host,
@@ -94,12 +103,14 @@ app.include_router(
     tags=["trainer"],
 )
 
+# Роутер фоновых задач:
 app.include_router(
     background_tasks_router,
     prefix="/api/v1/tasks",
     tags=["background_tasks"],
 )
 
+# ### Запуск сервера
 if __name__ == "__main__":
     uvicorn.run(
         "main:app",
