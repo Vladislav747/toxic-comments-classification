@@ -1,3 +1,5 @@
+"""Репозиторий для работы с фоновыми задачами в базе данных."""
+
 import datetime as dt
 from uuid import UUID
 
@@ -9,11 +11,30 @@ from serializers import BGTaskSchema
 
 
 class BgTasksRepository:
+    """Репозиторий для управления фоновыми задачами.
+    
+    Предоставляет методы для:
+    - Отслеживания статуса выполнения задач
+    - Создания новых задач
+    - Обновления результатов выполнения
+    - Удаления завершенных задач
+    """
     def __init__(self, db_session: AsyncSession) -> None:
+        """Инициализация репозитория с сессией БД.
+        
+        Args:
+            db_session: Асинхронная сессия SQLAlchemy
+        """
         self.db_session = db_session
 
     async def get_tasks(self) -> list[BgTask]:
+        """Получение всех фоновых задач с сортировкой по дате обновления.
+        
+        Returns:
+            Список задач, отсортированный по убыванию updated_at
+        """
         async with self.db_session as session:
+            # Получаем все задачи, отсортированные по времени обновления
             tasks: list[BgTask] = list((
                 await session.execute(
                     select(
@@ -24,10 +45,20 @@ class BgTasksRepository:
         return tasks
 
     async def create_task(self, task: BGTaskSchema) -> UUID:
+        """Создание новой фоновой задачи.
+        
+        Args:
+            task: Схема данных для создания задачи
+            
+        Returns:
+            UUID созданной задачи
+        """
+        # Создаем объект задачи с автоматически генерируемым UUID
         db_bg_task = BgTask(name=task.name)
         async with self.db_session as session:
             session.add(db_bg_task)
             await session.commit()
+            # в SQLAlchemy - это метод для принудительной отправки изменений в базу данных в рамках текущей транзакции, но без её завершения. - транзакция остается открытой
             await session.flush()
             return db_bg_task.uuid
 
@@ -38,6 +69,14 @@ class BgTasksRepository:
         result_msg: str,
         updated_at: dt.datetime
     ) -> None:
+        """Обновление статуса и результата выполнения задачи.
+        
+        Args:
+            task_uuid: Уникальный идентификатор задачи
+            status: Новый статус задачи
+            result_msg: Сообщение с результатом выполнения
+            updated_at: Время обновления
+        """
         async with self.db_session as session:
             await session.execute(
                 update(
@@ -51,9 +90,17 @@ class BgTasksRepository:
                 )
             )
             await session.commit()
+            # в SQLAlchemy - это метод для принудительной отправки изменений в базу данных в рамках текущей транзакции, но без её завершения. - транзакция остается открытой
             await session.flush()
 
     async def delete_tasks_by_uuid(self, task_uuids: list[UUID]) -> None:
+        """Удаление задач по списку UUID.
+        
+        Используется для очистки завершенных задач.
+        
+        Args:
+            task_uuids: Список UUID задач для удаления
+        """
         async with self.db_session as session:
             await session.execute(
                 delete(
@@ -63,4 +110,5 @@ class BgTasksRepository:
                 )
             )
             await session.commit()
+            # в SQLAlchemy - это метод для принудительной отправки изменений в базу данных в рамках текущей транзакции, но без её завершения. - транзакция остается открытой
             await session.flush()
