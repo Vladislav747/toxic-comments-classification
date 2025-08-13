@@ -101,20 +101,51 @@ class TrainerService:
         model_config: MLModelConfig,
         fit_dataset: pd.DataFrame
     ) -> MessageResponse:
-        """Train a new model."""
+        """
+        Запускает процесс обучения новой ML модели в фоновом режиме.
+        
+        Основная точка входа для обучения моделей. Выполняет предварительные проверки,
+        создает фоновую задачу и запускает асинхронное обучение в отдельном процессе.
+        Контролирует ограничения по количеству одновременно выполняющихся процессов.
+        
+        Процесс обучения:
+        1. Проверка ограничений по ресурсам (количество активных процессов)
+        2. Проверка уникальности имени модели
+        3. Запуск фоновой задачи обучения
+        4. Немедленный возврат ответа пользователю (асинхронность)
+        
+        Args:
+            model_config: Конфигурация модели (тип алгоритма, параметры, имя)
+            fit_dataset: Данные для обучения с колонками 'comment_text' и 'toxic'
+            
+        Returns:
+            Сообщение о том, что обучение запущено
+            
+        Raises:
+            ActiveProcessesLimitExceededError: Превышен лимит активных процессов
+            ModelNameAlreadyExistsError: Модель с таким именем уже существует
+        """
+        # === Проверка ограничений системы ===
+        # Контролируем количество одновременно обучающихся моделей для предотвращения перегрузки CPU
         if active_processes.value >= app_config.cores_cnt:
             raise ActiveProcessesLimitExceededError()
 
         model_name = model_config.name
 
+        # === Проверка уникальности имени модели ===
+        # Предотвращаем конфликты имен в базе данных
         if await self.models_repo.get_model_by_name(model_name):
             raise ModelNameAlreadyExistsError(model_name)
 
+        # === Запуск фонового обучения ===
+        # Добавляем задачу в FastAPI background tasks для асинхронного выполнения
+        # Это позволяет немедленно вернуть ответ пользователю, не ожидая завершения обучения
         self.background_tasks.add_task(
-            self._execute_fitting_task,
-            model_name, model_config, fit_dataset
+            self._execute_fitting_task,     # Метод для выполнения обучения
+            model_name, model_config, fit_dataset  # Параметры для обучения
         )
 
+        # Возвращаем подтверждение о запуске процесса обучения
         return MessageResponse(message=(
             f"Запущено обучение модели '{model_config.name}'."
         ))
@@ -125,85 +156,167 @@ class TrainerService:
         model_config: MLModelConfig,
         fit_dataset: pd.DataFrame
     ) -> None:
-        """Execute the fitting task."""
+        """
+        Выполняет процесс обучения модели в фоновом режиме.
+        
+        Этот метод запускается как фоновая задача и координирует весь жизненный цикл обучения:
+        - Создание записи о задаче в БД для мониторинга
+        - Запуск CPU-интенсивного обучения в отдельном процессе
+        - Обработка результатов и ошибок
+        - Обновление статуса задачи в БД
+        - Управление счетчиком активных процессов
+        
+        Процесс выполняется с таймаутом (30 минут) для предотвращения зависших задач.
+        В случае ошибки автоматически очищает созданные записи в БД.
+        
+        Args:
+            model_name: Уникальное имя модели для идентификации
+            model_config: Конфигурация алгоритма и параметров
+            fit_dataset: Обучающие данные
+            
+        Note:
+            Метод обновляет глобальный счетчик active_processes для контроля нагрузки.
+            При любом исходе (успех/ошибка) счетчик уменьшается на 1.
+        """
+        # Получаем текущий event loop для управления асинхронными операциями
         loop = asyncio.get_event_loop()
 
+        # === Создание записей для мониторинга ===
+        # Создаем запись о фоновой задаче для отслеживания прогресса пользователем
         bg_task_id = await self.bg_tasks_repo.create_task(
-            BGTaskSchema(name=f"Обучение модели '{model_name}'"))
+            BGTaskSchema(name=f"Обучение модели '{model_name}'")
+        )
+        # Создаем запись о модели в БД (пока не обученной)
         await self.models_repo.create_model(MLModelCreateSchema(
             name=model_name,
             type=model_config.ml_model_type
         ))
 
+        # === Увеличиваем счетчик активных процессов ===
+        # Используется для контроля нагрузки на систему
         active_processes.value += 1
         try:
+            # === Запуск обучения в отдельном процессе ===
+            # Используем ProcessPoolExecutor для изоляции CPU-интенсивных вычислений
+            # от основного asyncio event loop. Это предотвращает блокировку API.
             (
-                model_file_path,
-                model_params,
-                vectorizer_params
+                model_file_path,     # Путь к сохраненному файлу модели
+                model_params,        # Параметры обученной модели для БД
+                vectorizer_params    # Параметры векторизатора для БД
             ) = await asyncio.wait_for(
                 loop.run_in_executor(
-                    self.process_executor,
-                    train_and_save_model_task,
-                    model_config, fit_dataset
+                    self.process_executor,      # Пул процессов из состояния приложения
+                    train_and_save_model_task,  # Функция обучения (выполняется в отдельном процессе)
+                    model_config, fit_dataset   # Аргументы для функции обучения
                 ),
-                timeout=1800
+                timeout=1800  # Таймаут 30 минут для предотвращения зависших процессов
             )
 
+            # === Обновление модели после успешного обучения ===
+            # Сохраняем информацию об обученной модели в БД
             await self.models_repo.update_model_after_training(
                 model_name=model_name,
-                is_trained=True,
-                model_params=serialize_params(model_params),
-                vectorizer_params=serialize_params(vectorizer_params),
-                saved_model_file_path=str(model_file_path),
+                is_trained=True,                                    # Помечаем как обученную
+                model_params=serialize_params(model_params),        # Сериализуем параметры модели
+                vectorizer_params=serialize_params(vectorizer_params),  # Сериализуем параметры векторизатора
+                saved_model_file_path=str(model_file_path),         # Путь к файлу на диске
             )
 
+            # === Подготовка успешного результата ===
             status = BGTaskStatus.success
             result_msg = (
                 f"Модель '{model_name}' успешно обучена."
             )
+            # Уменьшаем счетчик активных процессов
             active_processes.value -= 1
         except Exception as e:
+            # === Обработка ошибок обучения ===
+            # Удаляем запись о модели из БД, так как обучение не завершилось
             await self.models_repo.delete_model(model_name)
 
             status = BGTaskStatus.failure
+            
+            # Специальная обработка таймаута (превышение 30 минут)
             if isinstance(e, TimeoutError):
                 result_msg = (
                     f"Превышено время обучения модели ({model_name}). "
                     "Задача остановлена."
                 )
-                logger.info(result_msg)
+                logger.info(result_msg)  # Таймаут - это не критическая ошибка
             else:
+                # Любая другая ошибка (недостаток памяти, некорректные данные, etc.)
                 result_msg = f"Ошибка при обучении модели '{model_name}': {e}."
-                logger.error(result_msg)
+                logger.error(result_msg)  # Логируем как ошибку
 
+            # Обязательно уменьшаем счетчик активных процессов
             active_processes.value -= 1
 
+        # === Обновление статуса фоновой задачи ===
+        # Обновляем информацию о задаче для отображения пользователю
         await self.bg_tasks_repo.update_task(
-            task_uuid=bg_task_id,
-            status=status,
-            result_msg=result_msg,
-            updated_at=dt.datetime.now()
+            task_uuid=bg_task_id,           # ID задачи для обновления
+            status=status,                  # Финальный статус (success/failure)
+            result_msg=result_msg,          # Сообщение с результатом или ошибкой
+            updated_at=dt.datetime.now()    # Время завершения
         )
+        
+        # === Очистка старых задач ===
+        # Автоматически удаляем старые завершенные задачи для оптимизации БД
         await self.bg_tasks_service.rotate_tasks()
 
     async def load_model(self, model_name: str) -> list[MessageResponse]:
-        """Load a model into memory."""
+        """
+        Загружает обученную модель в оперативную память для выполнения предсказаний.
+        
+        Процесс загрузки:
+        1. Проверка существования модели в БД
+        2. Проверка статуса обученности модели  
+        3. Проверка лимитов загруженных моделей
+        4. Десериализация модели с диска
+        5. Сохранение в глобальном кеше loaded_models
+        6. Обновление статуса is_loaded в БД
+        
+        Args:
+            model_name: Имя модели для загрузки из БД
+            
+        Returns:
+            Список с сообщением о успешной загрузке
+            
+        Raises:
+            ModelNotFoundError: Модель не найдена в БД
+            ModelNotTrainedError: Модель не обучена
+            ModelAlreadyLoadedError: Модель уже загружена в память
+            ModelsLimitExceededError: Превышен лимит загруженных моделей
+        """
+        # === Валидация модели и ограничений ===
         model = await self.models_repo.get_model_by_name(model_name)
+        
+        # Проверяем, что модель существует в БД
+        if not model:
+            raise ModelNotFoundError(model_name)
+            
+        # Проверяем, что модель не загружена уже в память
         if model.uuid in self.loaded_models:
             raise ModelAlreadyLoadedError(model_name)
+            
+        # Проверяем лимит одновременно загруженных моделей
+        # (пользовательские модели + модели по умолчанию)
         if len(self.loaded_models) >= (
             app_config.models_max_cnt + len(DEFAULT_MODELS_INFO)
         ):
             raise ModelsLimitExceededError()
-        if not model:
-            raise ModelNotFoundError(model_name)
+            
+        # Проверяем, что модель обучена и готова к использованию
         if not model.is_trained:
             raise ModelNotTrainedError(model_name)
 
+        # === Загрузка модели с диска в память ===
+        # Десериализуем сохраненный sklearn/transformers pipeline
         with open(model.saved_model_file_path, 'rb') as f:
             self.loaded_models[model.uuid] = cloudpickle.load(f)
 
+        # === Обновление статуса в БД ===
+        # Помечаем модель как загруженную для корректного отображения в UI
         await self.models_repo.update_model_is_loaded(model_name, True)
 
         return [MessageResponse(
@@ -231,23 +344,64 @@ class TrainerService:
         model_name: str,
         predict_data: PredictRequest
     ) -> PredictResponse:
-        """Make a prediction using a model."""
+        """
+        Выполняет предсказания токсичности текстов с использованием загруженной модели.
+        
+        Основной метод для инференса модели. Поддерживает как традиционные ML модели
+        (sklearn), так и современные DL модели (transformers). Автоматически определяет
+        тип модели и применяет соответствующий алгоритм предсказания.
+        
+        Процесс предсказания:
+        1. Валидация существования и загруженности модели
+        2. Получение модели из кеша loaded_models  
+        3. Определение типа модели (ML/DL)
+        4. Выполнение предсказания соответствующим методом
+        5. Возврат результатов в стандартизированном формате
+        
+        Args:
+            model_name: Имя модели для выполнения предсказаний
+            predict_data: Данные для предсказания (список текстов в поле X)
+            
+        Returns:
+            Объект с предсказаниями в виде списка (0 - не токсично, 1 - токсично)
+            
+        Raises:
+            ModelNotFoundError: Модель не найдена в БД
+            ModelNotLoadedError: Модель не загружена в память
+            
+        Note:
+            Для DL моделей используется специальная функция get_dl_model_predictions
+            для корректной обработки выхода transformers pipeline.
+        """
+        # === Валидация модели ===
         model = await self.models_repo.get_model_by_name(model_name)
 
+        # Проверяем существование модели в БД
         if not model:
             raise ModelNotFoundError(model_name)
+            
+        # Проверяем, что модель загружена в память (доступна для предсказаний)
         if model.uuid not in self.loaded_models:
             raise ModelNotLoadedError(model_name)
 
+        # === Получение модели из кеша ===
+        # Извлекаем загруженную модель по UUID из глобального словаря
         loaded_model = self.loaded_models.get(model.uuid)
+        
+        # === Выполнение предсказания в зависимости от типа модели ===
         if model.is_dl_model:
+            # Для DL моделей (transformers): используем специальную функцию
+            # которая корректно обрабатывает выход pipeline и возвращает метки классов
             predictions = get_dl_model_predictions(
-                loaded_model,
-                predict_data.X
+                loaded_model,           # Transformers pipeline
+                predict_data.X          # Список текстов для классификации
             )
         else:
+            # Для традиционных ML моделей (sklearn): прямой вызов метода predict
+            # sklearn pipeline автоматически применит векторизацию и классификацию
             predictions = loaded_model.predict(predict_data.X).tolist()
 
+        # Возвращаем результаты в стандартизированном формате
         return PredictResponse(predictions=predictions)
 
     async def get_models(
