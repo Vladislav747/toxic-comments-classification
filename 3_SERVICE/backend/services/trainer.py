@@ -270,9 +270,24 @@ class TrainerService:
             await self.models_repo.update_model_after_training(
                 model_name=model_name,
                 is_trained=True,                                    # Помечаем как обученную
-                model_params=serialize_params(model_params),        # Сериализуем параметры модели
-                vectorizer_params=serialize_params(vectorizer_params),  # Сериализуем параметры векторизатора
-                saved_model_file_path=str(model_file_path),         # Путь к файлу на диске
+                # === СЕРИАЛИЗАЦИЯ ПАРАМЕТРОВ ДЛЯ СОХРАНЕНИЯ В БД ===
+                # ПРОБЛЕМА: model_params и vectorizer_params содержат сложные Python объекты:
+                # - numpy arrays, функции, lambda, классы sklearn
+                # - Например: {'tokenizer': <function at 0x12345>, 'max_features': 1000}
+                # PostgreSQL НЕ МОЖЕТ напрямую сохранить такие объекты в JSON поле
+                #
+                # РЕШЕНИЕ: serialize_params() преобразует сложные объекты в простые типы:
+                # - Функции → строки с именем функции
+                # - numpy arrays → обычные списки  
+                # - Объекты классов → словари с их атрибутами
+                # - Результат: только str, int, float, bool, list, dict
+                #
+                # ПРИМЕР ПРЕОБРАЗОВАНИЯ:
+                # ДО:  {'tokenizer': <function>, 'max_features': 1000, 'vocab': array([...])}
+                # ПОСЛЕ: {'tokenizer': 'custom_tokenizer', 'max_features': 1000, 'vocab': [...]}
+                model_params=serialize_params(model_params),        # Python dict → JSON-совместимый dict
+                vectorizer_params=serialize_params(vectorizer_params),  # Python dict → JSON-совместимый dict
+                saved_model_file_path=str(model_file_path),         # Path объект → строка для БД
             )
 
             # === Подготовка успешного результата ===
