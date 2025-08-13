@@ -1,3 +1,14 @@
+"""
+Основной сервис для обучения и управления ML/DL моделями.
+
+Центральный компонент системы, отвечающий за:
+- Асинхронное обучение моделей в фоновых процессах
+- Загрузку/выгрузку моделей в память
+- Выполнение предсказаний
+- Управление жизненным циклом моделей
+- Мониторинг производительности и ресурсов
+"""
+
 import asyncio
 import datetime as dt
 import os
@@ -40,7 +51,20 @@ from store import DEFAULT_MODELS_INFO
 
 
 class TrainerService:
-    """Service for training and managing models."""
+    """
+    Главный сервис для обучения и управления ML/DL моделями.
+    
+    Этот сервис является центральным компонентом системы машинного обучения.
+    Координирует все операции с моделями: от обучения до развертывания.
+    
+    Основные возможности:
+    - Асинхронное обучение моделей с контролем ресурсов
+    - Управление загруженными в память моделями
+    - Выполнение предсказаний на загруженных моделях
+    - Автоматическая инициализация моделей по умолчанию
+    - Мониторинг фоновых задач обучения
+    - Безопасное удаление пользовательских моделей
+    """
 
     def __init__(
         self,
@@ -50,14 +74,27 @@ class TrainerService:
         background_tasks: BackgroundTasks,
         bg_tasks_service: BGTasksService
     ):
+        """
+        Инициализация сервиса с внедрением зависимостей.
+        
+        Args:
+            models_repo: Репозиторий для работы с моделями в БД
+            loaded_models: Глобальный словарь загруженных в память моделей (UUID -> model)
+            bg_tasks_repo: Репозиторий для работы с фоновыми задачами
+            background_tasks: FastAPI механизм для фоновых задач
+            bg_tasks_service: Сервис для управления фоновыми задачами
+        """
+        # Получаем пул процессов из глобального состояния приложения
+        # Используется для CPU-интенсивных задач обучения моделей
         from main import app
         self.process_executor = app.state.process_executor
 
-        self.models_repo = models_repo
-        self.loaded_models = loaded_models
-        self.bg_tasks_repo = bg_tasks_repo
-        self.background_tasks = background_tasks
-        self.bg_tasks_service = bg_tasks_service
+        # Внедренные зависимости для работы с данными и координации
+        self.models_repo = models_repo              # Доступ к моделям в БД
+        self.loaded_models = loaded_models          # Кеш загруженных моделей в памяти
+        self.bg_tasks_repo = bg_tasks_repo          # Управление фоновыми задачами
+        self.background_tasks = background_tasks    # FastAPI фоновые задачи
+        self.bg_tasks_service = bg_tasks_service    # Бизнес-логика фоновых задач
 
     async def fit_models(
         self,
