@@ -195,6 +195,7 @@ class TrainerService:
 
         # === Увеличиваем счетчик активных процессов ===
         # Используется для контроля нагрузки на систему
+        # # задавали в settings.py active_processes = multiprocessing.Value('i', 1)
         active_processes.value += 1
         try:
             # ========================================================================
@@ -406,17 +407,52 @@ class TrainerService:
         )]
 
     async def unload_model(self, model_name: str) -> list[MessageResponse]:
-        """Unload a model from memory."""
+        """
+        Выгружает модель из оперативной памяти, сохраняя запись в БД.
+        
+        Освобождает память, занятую загруженной моделью, но оставляет возможность
+        загрузить её снова позже. Модель остается в базе данных и на диске.
+        
+        Используется для управления памятью при работе с большим количеством моделей
+        или при необходимости освободить ресурсы.
+        
+        Args:
+            model_name: Имя модели для выгрузки из памяти
+            
+        Returns:
+            Список с сообщением об успешной выгрузке
+            
+        Raises:
+            ModelNotFoundError: Модель не найдена в БД
+            ModelNotLoadedError: Модель не загружена в память
+            DefaultModelRemoveUnloadError: Попытка выгрузить системную модель
+            
+        Note:
+            Системные модели (DEFAULT_MODELS_INFO) защищены от выгрузки.
+            После выгрузки модель можно снова загрузить методом load_model().
+        """
+        # === Валидация возможности выгрузки ===
         model = await self.models_repo.get_model_by_name(model_name)
+        
+        # Проверяем существование модели в БД
         if not model:
             raise ModelNotFoundError(model_name)
+            
+        # Проверяем, что модель загружена в память
         if model.uuid not in self.loaded_models:
             raise ModelNotLoadedError(model_name)
+            
+        # Защита системных моделей от выгрузки
         if model_name in DEFAULT_MODELS_INFO:
             raise DefaultModelRemoveUnloadError()
 
+        # === Выгрузка модели из памяти ===
+        # Удаляем из кеша загруженных моделей (освобождаем RAM)
         self.loaded_models.pop(model.uuid, None)
+        
+        # Обновляем статус в БД (помечаем как выгруженную)
         await self.models_repo.update_model_is_loaded(model_name, False)
+        
         return [MessageResponse(
             message=f"Модель '{model_name}' выгружена из памяти."
         )]
@@ -490,17 +526,43 @@ class TrainerService:
         self,
         is_dl: bool | None = None
     ) -> list[MLModelInListResponse]:
-        """Get a list of models."""
+        """
+        Получает список всех моделей или моделей определенного типа с их параметрами.
+        
+        Возвращает полную информацию о моделях в системе, включая их статус
+        (обученная/загруженная) и сериализованные параметры для отображения в UI.
+        
+        Args:
+            is_dl: Фильтр по типу модели:
+                - True: только DL модели (transformers)  
+                - False: только ML модели (sklearn)
+                - None: все модели (по умолчанию)
+                
+        Returns:
+            Список объектов MLModelInListResponse с информацией о каждой модели:
+            - uuid, name, type: идентификация модели
+            - is_trained, is_loaded: статусы модели
+            - model_params, vectorizer_params: параметры в JSON-формате
+            
+        Note:
+            Параметры автоматически сериализуются для безопасной передачи в UI.
+            Используется для отображения списка моделей в веб-интерфейсе.
+        """
+        # === Формирование списка моделей для ответа ===
         response_list = []
 
+        # Получаем модели из БД с опциональной фильтрацией по типу
         for model_info in await self.models_repo.get_models(is_dl=is_dl):
+            # === Создание объекта ответа для каждой модели ===
             response_list.append(
                 MLModelInListResponse(
                     uuid=model_info.uuid,
                     name=model_info.name,
                     type=model_info.type,
-                    is_trained=model_info.is_trained,
-                    is_loaded=model_info.is_loaded,
+                    is_trained=model_info.is_trained,      # Статус обученности
+                    is_loaded=model_info.is_loaded,        # Статус загруженности в память
+                    # === Сериализация параметров для UI ===
+                    # Преобразуем сложные Python объекты в JSON-совместимый формат
                     model_params=serialize_params(model_info.model_params),
                     vectorizer_params=serialize_params(
                         model_info.vectorizer_params
@@ -515,67 +577,179 @@ class TrainerService:
         model_names: list[str],
         predict_dataset: pd.DataFrame
     ) -> pd.DataFrame:
-        """Get prediction scores."""
+        """
+        Получает оценки (scores/вероятности) предсказаний от нескольких моделей для анализа производительности.
+        
+        Этот метод используется для сравнения производительности различных моделей на одном датасете.
+        В отличие от обычного predict(), возвращает не метки классов (0/1), а непрерывные оценки
+        вероятности токсичности, что позволяет построить ROC-кривые и вычислить метрики качества.
+        
+        Процесс выполнения:
+        1. Валидация существования и загруженности всех запрошенных моделей
+        2. Для каждой модели выполнение предсказаний с получением scores
+        3. Объединение результатов в единый DataFrame для анализа
+        
+        Args:
+            model_names: Список имен моделей для сравнения
+            predict_dataset: DataFrame с колонками 'comment_text' (тексты) и 'toxic' (true labels)
+            
+        Returns:
+            DataFrame с колонками:
+            - 'model_name': имя модели
+            - 'scores': вероятности/оценки токсичности (float от 0 до 1)
+            - 'y_true': истинные метки (0/1)
+            
+        Raises:
+            ModelNotFoundError: Одна из моделей не найдена в БД
+            ModelNotLoadedError: Одна из моделей не загружена в память
+            
+        Note:
+            Используется для построения ROC-кривых, вычисления AUC и других метрик качества.
+            Для DL моделей получает вероятности через return_scores=True.
+            Для ML моделей использует predict_proba() или decision_function().
+        """
+        # === Получение информации о моделях из БД ===
         models = await self.models_repo.get_models_by_names(model_names)
 
+        # === Валидация существования всех запрошенных моделей ===
+        # Проверяем, что все модели из списка найдены в БД
         for model_name in model_names:
             if model_name not in [db_model.name for db_model in models]:
                 raise ModelNotFoundError(model_name)
+                
+        # === Валидация загруженности всех моделей ===
+        # Проверяем, что все модели загружены в память и доступны для предсказаний
         for db_model in models:
             if db_model.uuid not in self.loaded_models:
                 raise ModelNotLoadedError(db_model.name)
 
+        # === Выполнение предсказаний для каждой модели ===
         results = []
         for db_model in models:
+            # Получаем загруженную модель из кеша
             loaded_model = self.loaded_models.get(db_model.uuid)
 
-            X = predict_dataset["comment_text"]
-            y_true = predict_dataset["toxic"]
+            # Извлекаем данные из датасета
+            X = predict_dataset["comment_text"]  # Тексты для предсказания
+            y_true = predict_dataset["toxic"]    # Истинные метки для сравнения
 
+            # === Получение scores в зависимости от типа модели ===
             if db_model.is_dl_model:
+                # Для DL моделей (transformers): используем специальную функцию с флагом return_scores
+                # Возвращает вероятности токсичности (float от 0 до 1)
                 scores = get_dl_model_predictions(
-                    loaded_model,
-                    X.tolist(),
-                    return_scores=True
+                    loaded_model,           # Transformers pipeline
+                    X.tolist(),            # Конвертируем pandas Series в список
+                    return_scores=True     # Важно! Возвращаем scores, а не метки классов
                 )
             else:
+                # Для традиционных ML моделей (sklearn): проверяем доступные методы
                 if hasattr(loaded_model, "predict_proba"):
+                    # predict_proba() возвращает вероятности для каждого класса: [[p0, p1], ...]
+                    # Берем второй столбец ([:, 1]) - вероятность класса "токсично"
                     scores = loaded_model.predict_proba(X)[:, 1]
                 else:
+                    # decision_function() возвращает "расстояние" до разделяющей гиперплоскости
+                    # Положительные значения = токсично, отрицательные = не токсично
+                    # Не нормализовано к [0,1], но подходит для ROC-анализа
                     scores = loaded_model.decision_function(X)
 
+            # === Создание DataFrame с результатами для текущей модели ===
             results.append(pd.DataFrame({
-                "model_name": db_model.name,
-                "scores": scores,
-                "y_true": y_true
+                "model_name": db_model.name,  # Имя модели для идентификации
+                "scores": scores,             # Оценки/вероятности токсичности
+                "y_true": y_true             # Истинные метки для вычисления метрик
             }))
 
+        # === Объединение результатов всех моделей в один DataFrame ===
+        # Это позволяет легко сравнивать модели и строить графики
         return pd.concat(results, ignore_index=True)
 
     async def remove_model(self, model_name: str) -> list[MessageResponse]:
-        """Remove a model."""
+        """
+        Полное удаление пользовательской модели из системы.
+        
+        Выполняет комплексное удаление модели:
+        1. Удаление записи из базы данных
+        2. Удаление из кеша загруженных моделей (оперативная память)
+        3. Удаление файла модели с диска
+        
+        Защищает системные модели по умолчанию от случайного удаления.
+        
+        Args:
+            model_name: Имя модели для удаления
+            
+        Returns:
+            Список с сообщением об успешном удалении
+            
+        Raises:
+            ModelNotFoundError: Модель не найдена в БД
+            DefaultModelRemoveUnloadError: Попытка удалить системную модель
+            
+        Note:
+            Модели по умолчанию (из DEFAULT_MODELS_INFO) защищены от удаления.
+            Операция необратима - восстановить модель можно только переобучив заново.
+        """
+        # === Валидация возможности удаления ===
         model = await self.models_repo.get_model_by_name(model_name)
 
+        # Проверяем существование модели в БД
         if not model:
             raise ModelNotFoundError(model_name)
+            
+        # Защита системных моделей от удаления
         if model_name in DEFAULT_MODELS_INFO:
             raise DefaultModelRemoveUnloadError()
 
+        # === Комплексное удаление модели ===
+        # Сохраняем путь к файлу для последующего удаления
         saved_model_filepath = model.saved_model_file_path
+        
+        # 1. Удаляем запись из базы данных
         await self.models_repo.delete_model(model_name)
-        self.loaded_models.pop(model_name, None)
+        
+        # 2. Удаляем из кеша загруженных моделей (освобождаем RAM)  
+        # ВАЖНО: используем model.uuid, а не model_name как ключ в loaded_models
+        self.loaded_models.pop(model.uuid, None)  # None = не выбрасывать исключение если ключа нет
+        
+        # 3. Удаляем файл модели с диска (освобождаем дисковое пространство)
         if os.path.isfile(saved_model_filepath):
             os.remove(saved_model_filepath)
 
         return [MessageResponse(message=f"Модель '{model_name}' удалена.")]
 
     async def remove_all_models(self) -> MessageResponse:
-        """Remove all models."""
+        """
+        Массовое удаление всех пользовательских моделей из системы.
+        
+        Выполняет полную очистку системы от пользовательских моделей, сохраняя
+        только системные модели по умолчанию. Операция включает:
+        1. Удаление всех записей из БД (кроме DEFAULT_MODELS_INFO)
+        2. Очистка кеша загруженных моделей 
+        3. Удаление всех файлов моделей с диска
+        
+        Используется для "сброса к заводским настройкам" или освобождения места.
+        
+        Returns:
+            Сообщение о количестве удаленных моделей
+            
+        Note:
+            Системные модели (DEFAULT_MODELS_INFO) остаются нетронутыми.
+            Операция необратима - все пользовательские модели будут потеряны.
+            Рекомендуется создать резервную копию важных моделей перед выполнением.
+        """
+        # === Массовое удаление пользовательских моделей ===
+        # Репозиторий автоматически исключает модели из DEFAULT_MODELS_INFO
         deleted_models = await self.models_repo.delete_all_user_models()
+        
+        # === Очистка файлов и кеша для каждой удаленной модели ===
         for model in deleted_models:
+            # Удаляем файл модели с диска (если существует)
             file_path = model.saved_model_file_path
             if file_path and os.path.isfile(file_path):
                 os.remove(file_path)
+                
+            # Удаляем из кеша загруженных моделей (освобождаем RAM)
             self.loaded_models.pop(model.uuid, None)
 
         return MessageResponse(
@@ -583,41 +757,72 @@ class TrainerService:
         )
 
     async def create_and_load_models(self) -> None:
-        """Create default models."""
+        """
+        Инициализация и загрузка системных моделей по умолчанию при запуске приложения.
+        
+        Этот метод выполняется при старте сервера и обеспечивает готовность базовых моделей
+        к работе. Обрабатывает как предобученные ML модели (sklearn), так и DL модели (transformers).
+        
+        Процесс инициализации:
+        1. Итерация по всем моделям из DEFAULT_MODELS_INFO
+        2. Загрузка каждой модели с диска (ML/DL)
+        3. Создание/обновление записей в БД
+        4. Загрузка в кеш для немедленного использования
+        5. Восстановление ранее загруженных пользовательских моделей
+        
+        Note:
+            Модели по умолчанию должны быть предварительно обучены и сохранены в директории models/default/.
+            Метод автоматически определяет тип модели (ML/DL) и применяет соответствующий загрузчик.
+            Пользовательские модели с флагом is_loaded=True также восстанавливаются в память.
+        """
+        # === Инициализация системных моделей по умолчанию ===
         for model_name, model_info in DEFAULT_MODELS_INFO.items():
+            # Формируем путь к файлу модели в директории по умолчанию
             saved_model_path = MODELS_DIR / "default" / model_info["filename"]
             is_dl_model = model_info["is_dl_model"]
 
+            # === Загрузка модели в зависимости от типа ===
             if is_dl_model:
+                # Для DL моделей (transformers): загружаем с указанием токенизатора
                 pipe, model_params, vectorizer_params = get_dl_model(
-                    saved_model_path,
-                    model_info["tokenizer"]
+                    saved_model_path,           # Путь к директории с моделью
+                    model_info["tokenizer"]     # Имя соответствующего токенизатора
                 )
             else:
+                # Для традиционных ML моделей (sklearn): загружаем из cloudpickle файла
                 pipe, model_params, vectorizer_params = get_ml_model(
-                    saved_model_path
+                    saved_model_path           # Путь к .cloudpickle файлу
                 )
 
+            # === Создание/обновление записи в БД ===
             db_model = await self.models_repo.get_model_by_name(model_name)
             if db_model:
+                # Модель уже существует в БД - используем существующий UUID
                 db_model_uuid = db_model.uuid
             else:
+                # Создаем новую запись в БД для модели по умолчанию
                 db_model_uuid = await self.models_repo.create_model(
                     MLModelCreateSchema(
                         name=model_name,
                         type=model_info["type"],
                         is_dl_model=is_dl_model,
-                        is_trained=True,
-                        is_loaded=True,
+                        is_trained=True,                    # Модели по умолчанию уже обучены
+                        is_loaded=True,                     # Помечаем как загруженную
                         model_params=model_params,
                         vectorizer_params=vectorizer_params,
                         saved_model_file_path=saved_model_path
                     )
                 )
 
+            # === Загрузка в кеш для немедленного использования ===
             self.loaded_models[db_model_uuid] = pipe
 
+        # === Восстановление ранее загруженных пользовательских моделей ===
+        # После перезапуска сервера восстанавливаем в память все модели,
+        # которые были загружены до остановки (is_loaded=True)
         for db_model in await self.models_repo.get_models():
+            # Проверяем, что это пользовательская модель (не системная) и она была загружена
             if db_model.name not in DEFAULT_MODELS_INFO and db_model.is_loaded:
+                # Десериализуем модель с диска и загружаем в кеш
                 with open(db_model.saved_model_file_path, "rb") as f:
                     self.loaded_models[db_model.uuid] = cloudpickle.load(f)
