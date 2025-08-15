@@ -209,9 +209,8 @@ class ModelsRepository:
         #     if model.name not in DEFAULT_MODELS_INFO:
         #         model_to_remove_names.append(model.name)
         model_to_remove_names = [
-            model.name                              # Извлекаем имя модели
-            for model in all_models                 # Итерируемся по всем моделям
-            if model.name not in DEFAULT_MODELS_INFO  # Исключаем системные модели
+            model.name for model in await self.get_models()
+            if model.name not in DEFAULT_MODELS_INFO
         ]
         async with self.db_session as session:
             deleted_models: list[Model] = list((

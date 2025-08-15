@@ -68,6 +68,7 @@ class FunctionWrapper:
         # Сериализуем функцию с помощью cloudpickle (поддерживает lambda и closures)
         self.fn_ser = cloudpickle.dumps(fn)
 
+    # когда вызывается объект класса FunctionWrapper, то вызывается метод __call__
     def __call__(self, *args, **kwargs):
         """
         Десериализует и выполняет обернутую функцию.
@@ -97,6 +98,10 @@ class SpacyTokenizer(BaseEstimator, TransformerMixin):
     Совместим с sklearn Pipeline (наследует BaseEstimator, TransformerMixin).
     """
     # Загружаем английскую модель SpaCy (требует: python -m spacy download en_core_web_sm)
+    # Очень важная оптимизация!
+    # ❌ Каждый новый объект загружал бы модель заново
+    # ❌ Создание 100 токенизаторов = 100 × 3 секунды = 5 минут!
+    # ❌ Память: 100 копий одной и той же модели
     nlp = spacy.load('en_core_web_sm')
     # Загружаем список английских стоп-слов из NLTK
     stopwords = set(nltk.corpus.stopwords.words('english'))
@@ -114,6 +119,11 @@ class SpacyTokenizer(BaseEstimator, TransformerMixin):
         self.n_process = n_process        # Количество процессов для SpaCy
         self.batch_size = batch_size      # Размер батча для оптимизации памяти
 
+    # Статический потому что:
+    # ✅ Не зависит от состояния объекта - не использует self
+    # ✅ Чистая функция - одинаковый вход → одинаковый выход
+    # ✅ Может использоваться без создания экземпляра
+    # ✅ Логически связан с классом, но не с конкретным объектом
     @staticmethod
     def normalize_text(doc: str) -> str:
         """

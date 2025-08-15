@@ -627,6 +627,7 @@ class TrainerService:
         results = []
         for db_model in models:
             # Получаем загруженную модель из кеша
+            # возвращает sklearn Pipeline объект
             loaded_model = self.loaded_models.get(db_model.uuid)
 
             # Извлекаем данные из датасета
@@ -645,34 +646,8 @@ class TrainerService:
             else:
                 # Для традиционных ML моделей (sklearn): проверяем доступные методы
                 if hasattr(loaded_model, "predict_proba"):
-                    # ========================================================================
-                    # ПОДРОБНОЕ ОБЪЯСНЕНИЕ predict_proba():
-                    # ========================================================================
-                    # 
-                    # loaded_model - это sklearn.pipeline.Pipeline, который состоит из:
-                    # 1. Векторизатор (CountVectorizer/TfidfVectorizer) - преобразует тексты в числа
-                    # 2. Классификатор (LogisticRegression/MultinomialNB) - делает предсказания
-                    # 
-                    # Pipeline.predict_proba() автоматически:
-                    # 1. Применяет векторизатор к текстам: "hello world" → [0, 1, 0, 1, 0, ...]
-                    # 2. Передает векторы в классификатор.predict_proba()
-                    # 3. Возвращает вероятности для каждого класса
-                    # 
-                    # ФОРМАТ ВОЗВРАТА predict_proba():
-                    # [[prob_class_0, prob_class_1],    # для первого текста
-                    #  [prob_class_0, prob_class_1],    # для второго текста  
-                    #  ...]
-                    # 
-                    # ПРИМЕР:
-                    # texts = ["good comment", "you are stupid"]
-                    # loaded_model.predict_proba(texts) возвращает:
-                    # [[0.9, 0.1],    # "good comment": 90% не токсично, 10% токсично
-                    #  [0.2, 0.8]]    # "you are stupid": 20% не токсично, 80% токсично
-                    # 
-                    # ВОТ ПОЧЕМУ [:, 1]:
-                    # - [:, 1] берет ВТОРОЙ столбец (индекс 1) = вероятности класса "токсично"
-                    # - Результат: [0.1, 0.8] - только вероятности токсичности
-                    # ========================================================================
+                    # predict_proba() возвращает вероятности для каждого класса: [[p0, p1], ...]
+                    # Берем второй столбец ([:, 1]) - вероятность класса "токсично"
                     scores = loaded_model.predict_proba(X)[:, 1]
                 else:
                     # decision_function() возвращает "расстояние" до разделяющей гиперплоскости
@@ -734,6 +709,7 @@ class TrainerService:
         # 1. Удаляем запись из базы данных
         await self.models_repo.delete_model(model_name)
         
+        # .pop метод удаления элемента из словаря с двумя аргументами:
         # 2. Удаляем из кеша загруженных моделей (освобождаем RAM)  
         # ВАЖНО: используем model.uuid, а не model_name как ключ в loaded_models
         self.loaded_models.pop(model.uuid, None)  # None = не выбрасывать исключение если ключа нет
@@ -851,4 +827,5 @@ class TrainerService:
             if db_model.name not in DEFAULT_MODELS_INFO and db_model.is_loaded:
                 # Десериализуем модель с диска и загружаем в кеш
                 with open(db_model.saved_model_file_path, "rb") as f:
+                    # десериализуем модель с диска и загружаем в кеш
                     self.loaded_models[db_model.uuid] = cloudpickle.load(f)
